@@ -1,0 +1,235 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $ruler := $cfg.ruler -}}
+{{- if $ruler.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- $root := . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $stateless := eq ($ruler.mode | default "statefulset") "stateless" -}}
+{{- $dyn := $ruler.dynamicRules.enabled -}}
+{{- $allKeys := keys ($ruler.ruleFiles | default dict) | sortAlpha -}}
+{{- range $shard := (include "thanos-stack.rulerShards" . | fromYamlArray) }}
+{{- $shardKeys := $shard.ruleFileKeys | default $allKeys -}}
+{{- $shardCMs := $shard.existingRuleConfigMaps | default ($ruler.existingRuleConfigMaps | default list) }}
+{{- $replicas := int ($shard.replicas | default $ruler.replicas | default 1) }}
+---
+apiVersion: apps/v1
+kind: {{ if $stateless }}Deployment{{ else }}StatefulSet{{ end }}
+metadata:
+  name: {{ $fn }}-ruler-{{ $shard.name }}
+  labels:
+    {{- include "thanos-stack.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: ruler
+    thanos.io/rule-shard: {{ $shard.name | quote }}
+spec:
+  replicas: {{ $replicas }}
+  {{- if not $stateless }}
+  serviceName: {{ $fn }}-ruler-{{ $shard.name }}-headless
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" $root "component" "ruler") | nindent 6 }}
+      thanos.io/rule-shard: {{ $shard.name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "thanos-stack.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: ruler
+        thanos.io/rule-shard: {{ $shard.name | quote }}
+      annotations:
+        checksum/rules: {{ toYaml (dict "f" $ruler.ruleFiles "k" $shardKeys "c" $shardCMs) | sha256sum }}
+        {{- with $root.Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ if $dyn }}{{ $fn }}-ruler{{ else }}{{ include "thanos-stack.serviceAccountName" $root }}{{ end }}
+      securityContext:
+        {{- include "thanos-stack.podSecurityContext" $root | nindent 8 }}
+      {{- include "thanos-stack.podHardening" (dict "ctx" $root "component" "ruler" "terminationGracePeriodSeconds" 120 "automountServiceAccountToken" $dyn) | nindent 6 }}
+      containers:
+        - name: ruler
+          image: {{ include "thanos-stack.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" $root | nindent 12 }}
+          args:
+            - rule
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            - --data-dir=/var/thanos/rule
+            - --eval-interval={{ $ruler.evalInterval }}
+            - --rule-file=/etc/thanos/rules/*.yaml
+            - --rule-file=/etc/thanos/rules/*.yml
+            {{- if $dyn }}
+            - --rule-file=/etc/thanos/rules-dynamic/*.yaml
+            - --rule-file=/etc/thanos/rules-dynamic/*.yml
+            {{- end }}
+            - --label=rule_shard="{{ $shard.name }}"
+            - --label=ruler_replica="$(POD_NAME)"
+            - --alert.label-drop=ruler_replica
+            {{- include "thanos-stack.externalLabelArgs" $root | nindent 12 }}
+            - --query=dnssrv+_http._tcp.{{ $fn }}-query-headless.{{ $ns }}.svc.cluster.local
+            - --alert.query-url=http://{{ $fn }}-query-frontend.{{ $ns }}.svc.cluster.local:10902
+            {{- range $ruler.alertmanagers }}
+            - --alertmanagers.url={{ . }}
+            {{- end }}
+            {{- if $stateless }}
+            - --remote-write.config-file=/etc/thanos/remote-write/remote-write.yml
+            {{- else }}
+            - --tsdb.retention=48h
+            - --tsdb.block-duration=2h
+            - {{ include "thanos-stack.objstoreArg" $root }}
+            {{- end }}
+            {{- range $ruler.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            {{- with $root.Values.extraEnv }}{{- toYaml . | nindent 12 }}{{- end }}
+          ports:
+            - { name: grpc, containerPort: 10901 }
+            - { name: http, containerPort: 10902 }
+          startupProbe:
+            httpGet: { path: /-/ready, port: http }
+            failureThreshold: 40
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 30
+          {{- with $ruler.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: data, mountPath: /var/thanos/rule }
+            - { name: rules, mountPath: /etc/thanos/rules, readOnly: true }
+            {{- if $dyn }}
+            - { name: rules-dynamic, mountPath: /etc/thanos/rules-dynamic, readOnly: true }
+            {{- end }}
+            - { name: tmp, mountPath: /tmp }
+            {{- if $stateless }}
+            - { name: remote-write, mountPath: /etc/thanos/remote-write, readOnly: true }
+            {{- else }}
+            {{- include "thanos-stack.objstoreVolumeMount" $root | nindent 12 }}
+            {{- end }}
+        - name: reloader
+          image: {{ $ruler.reloader.image }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" $root | nindent 12 }}
+          args:
+            - --reload-url=http://127.0.0.1:10902/-/reload
+            - --watched-dir=/etc/thanos/rules
+            {{- if $dyn }}
+            - --watched-dir=/etc/thanos/rules-dynamic
+            {{- end }}
+          {{- with $ruler.reloader.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: rules, mountPath: /etc/thanos/rules, readOnly: true }
+            {{- if $dyn }}
+            - { name: rules-dynamic, mountPath: /etc/thanos/rules-dynamic, readOnly: true }
+            {{- end }}
+        {{- if $dyn }}
+        - name: rules-sync
+          image: {{ $ruler.dynamicRules.image }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" $root | nindent 12 }}
+          env:
+            - { name: METHOD,        value: WATCH }
+            - { name: LABEL,         value: {{ (splitn "=" 2 $ruler.dynamicRules.labelSelector)._0 | quote }} }
+            - { name: LABEL_VALUE,   value: {{ (splitn "=" 2 $ruler.dynamicRules.labelSelector)._1 | quote }} }
+            - { name: FOLDER,        value: /etc/thanos/rules-dynamic }
+            - { name: NAMESPACE,     value: {{ $ruler.dynamicRules.namespaces | quote }} }
+            - { name: RESOURCE,      value: configmap }
+            - { name: UNIQUE_FILENAMES, value: "true" }
+          {{- with $ruler.dynamicRules.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: rules-dynamic, mountPath: /etc/thanos/rules-dynamic }
+            - { name: tmp, mountPath: /tmp }
+        {{- end }}
+      volumes:
+        {{- if $dyn }}
+        - name: rules-dynamic
+          emptyDir: {}
+        {{- end }}
+        - name: rules
+          {{- if or $shardKeys $shardCMs }}
+          projected:
+            sources:
+              {{- range $shardKeys }}
+              - configMap:
+                  name: {{ $fn }}-ruler-rules-{{ regexReplaceAll "[^a-zA-Z0-9]+" . "-" | trimSuffix "-" | lower }}
+              {{- end }}
+              {{- range $shardCMs }}
+              - configMap:
+                  name: {{ . }}
+              {{- end }}
+          {{- else }}
+          emptyDir: {}   # no rules configured yet — see RULES.md
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if $stateless }}
+        - name: data
+          emptyDir: {}
+        - name: remote-write
+          configMap:
+            name: {{ $fn }}-ruler-remote-write
+        {{- else }}
+        {{- include "thanos-stack.objstoreVolume" $root | nindent 8 }}
+        {{- end }}
+  {{- if not $stateless }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if $ruler.persistence.storageClass }}
+        storageClassName: {{ $ruler.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $ruler.persistence.size }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-ruler-{{ $shard.name }}-headless
+  labels:
+    {{- include "thanos-stack.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: ruler
+    thanos.io/rule-shard: {{ $shard.name | quote }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" $root "component" "ruler") | nindent 4 }}
+    thanos.io/rule-shard: {{ $shard.name | quote }}
+  ports:
+    - { name: grpc, port: 10901, targetPort: grpc }
+    - { name: http, port: 10902, targetPort: http }
+{{- if gt $replicas 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}-ruler-{{ $shard.name }}
+  labels:
+    {{- include "thanos-stack.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: ruler
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" $root "component" "ruler") | nindent 6 }}
+      thanos.io/rule-shard: {{ $shard.name | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

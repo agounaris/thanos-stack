@@ -1,0 +1,28 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $r := $cfg.receive -}}
+{{- $mt := .Values.multiTenancy -}}
+{{- $limits := deepCopy ($r.limitsConfig | default dict) -}}
+{{- if and $mt.enabled $mt.tenants -}}
+  {{- $write := (dig "write" dict $limits) -}}
+  {{- $tenants := (dig "tenants" dict $write) -}}
+  {{- range $t := $mt.tenants -}}
+    {{- if $t.limits -}}
+      {{- $_ := set $tenants $t.name $t.limits -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $_ := set $write "tenants" $tenants -}}
+  {{- $_ := set $limits "write" $write -}}
+{{- end -}}
+{{- if and $r.enabled $limits -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-receive-limits
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receive
+data:
+  limits.yml: |
+    {{- toYaml $limits | nindent 4 }}
+{{- end }}

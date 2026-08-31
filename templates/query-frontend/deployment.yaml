@@ -1,0 +1,136 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $qf := $cfg.queryFrontend -}}
+{{- if $qf.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- $mc := eq ($qf.cache.type | default "inmemory") "memcached" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-query-frontend-cache
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query-frontend
+data:
+  cache.yml: |
+    {{- if $mc }}
+    type: MEMCACHED
+    config:
+      addresses:
+        {{- range $qf.cache.memcached.addresses }}
+        - {{ . | quote }}
+        {{- end }}
+      max_idle_connections: 100
+      max_async_concurrency: 20
+      dns_provider_update_interval: 10s
+    {{- else }}
+    type: IN-MEMORY
+    config:
+      max_size: {{ $qf.cache.inmemory.maxSize | quote }}
+      max_size_items: 0
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-query-frontend
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query-frontend
+spec:
+  replicas: {{ $qf.replicas }}
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "query-frontend") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thanos-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: query-frontend
+      annotations:
+        checksum/cache: {{ toYaml $qf.cache | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "thanos-stack.serviceAccountName" . }}
+      securityContext:
+        {{- include "thanos-stack.podSecurityContext" . | nindent 8 }}
+      {{- include "thanos-stack.podHardening" (dict "ctx" . "component" "query-frontend") | nindent 6 }}
+      containers:
+        - name: query-frontend
+          image: {{ include "thanos-stack.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" . | nindent 12 }}
+          args:
+            - query-frontend
+            - --http-address=0.0.0.0:10902
+            - --query-frontend.downstream-url=http://{{ $fn }}-query.{{ .Release.Namespace }}.svc.cluster.local:10902
+            - --query-range.split-interval={{ $qf.splitInterval }}
+            - --labels.split-interval={{ $qf.splitInterval }}
+            - --query-range.max-retries-per-request={{ $qf.maxRetries }}
+            - --labels.max-retries-per-request={{ $qf.maxRetries }}
+            - --query-frontend.log-queries-longer-than={{ $qf.logQueriesLongerThan }}
+            - --query-range.response-cache-config-file=/etc/thanos/cache/cache.yml
+            - --labels.response-cache-config-file=/etc/thanos/cache/cache.yml
+            - --cache-compression-type=snappy
+            {{- if .Values.multiTenancy.enabled }}
+            # forward the tenant header downstream AND split the results cache per tenant
+            - --query-frontend.forward-header={{ .Values.multiTenancy.tenantHeader }}
+            - --query-frontend.tenant-header={{ .Values.multiTenancy.tenantHeader }}
+            - --query-frontend.default-tenant-id={{ .Values.multiTenancy.defaultTenant }}
+            {{- end }}
+            {{- range $qf.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - { name: http, containerPort: 10902 }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 30
+          {{- with $qf.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: cache, mountPath: /etc/thanos/cache }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: cache
+          configMap:
+            name: {{ $fn }}-query-frontend-cache
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-query-frontend
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query-frontend
+spec:
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "query-frontend") | nindent 4 }}
+  ports:
+    - { name: http, port: 10902, targetPort: http }
+{{- if gt (int $qf.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}-query-frontend
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query-frontend
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "query-frontend") | nindent 6 }}
+{{- end }}
+{{- end }}

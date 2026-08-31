@@ -1,0 +1,26 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $r := $cfg.receive -}}
+{{- if $r.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $endpoints := list -}}
+{{- range $i := until (int $r.replicas) -}}
+{{- $endpoints = append $endpoints (printf "%s-receive-%d.%s-receive-headless.%s.svc.cluster.local:10901" $fn $i $fn $ns) -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-receive-hashring
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receive
+data:
+  hashring.json: |
+    [
+      {
+        "hashring": "default",
+        "tenants": [],
+        "endpoints": {{ $endpoints | toJson }}
+      }
+    ]
+{{- end }}

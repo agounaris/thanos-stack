@@ -1,0 +1,92 @@
+{{- $mt := .Values.multiTenancy -}}
+{{- if and $mt.enabled $mt.ingestGateway.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- $g := $mt.ingestGateway -}}
+{{- $hdr := $mt.tenantHeader -}}
+{{- $method := $g.auth.method | default "mtls" -}}
+{{- $rwPort := (include "thanos-stack.cfg" . | fromYaml).receive.service.remoteWritePort | default 19291 -}}
+{{- $idVar := "" -}}
+{{- if eq $method "mtls" }}{{ $idVar = printf "http_%s" ($g.auth.mtlsCNHeader | replace "-" "_" | lower) }}{{ end -}}
+{{- if eq $method "basic" }}{{ $idVar = "remote_user" }}{{ end -}}
+{{- if eq $method "none" }}{{ $idVar = printf "http_%s" ($hdr | replace "-" "_" | lower) }}{{ end -}}
+{{- $allowUnauth := eq $g.onUnauthenticated "default" -}}
+{{- if and $allowUnauth (eq $method "basic") -}}
+{{- fail "multiTenancy.ingestGateway: auth.method=basic always 401s a request with no credentials, so onUnauthenticated=default cannot work. Use auth.method=mtls or none for the 'accept into defaultTenant' behaviour, or set onUnauthenticated=reject." -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-ingest-gateway
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingest-gateway
+data:
+  nginx.conf: |
+    worker_processes auto;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+    events { worker_connections 1024; }
+    http {
+      access_log /dev/stdout;
+      client_body_temp_path /tmp/client_body;
+      proxy_temp_path /tmp/proxy;
+      fastcgi_temp_path /tmp/fastcgi;
+      uwsgi_temp_path /tmp/uwsgi;
+      scgi_temp_path /tmp/scgi;
+      client_max_body_size 64m;
+
+      # push-client identity -> tenant (only allowlisted names resolve)
+      map ${{ $idVar }} $tenant {
+        default "";
+        {{- range $t := $mt.tenants }}
+        {{- $user := $t.name }}
+        {{- range $u, $mapped := $g.auth.userToTenant }}{{ if eq $mapped $t.name }}{{ $user = $u }}{{ end }}{{ end }}
+        {{ $user | quote }} {{ $t.name | quote }};
+        {{- end }}
+      }
+      # unknown/absent identity -> default tenant (if allowed) else stays ""
+      map $tenant $effective_tenant {
+        default   $tenant;
+        ""        {{ if $allowUnauth }}{{ $mt.defaultTenant | quote }}{{ else }}""{{ end }};
+      }
+      # unknown/absent identity -> reject?
+      map $tenant $reject_unauth {
+        default   0;
+        ""        {{ if $allowUnauth }}0{{ else }}1{{ end }};
+      }
+
+      upstream receive_router {
+        server {{ $fn }}-receive.{{ .Release.Namespace }}.svc.cluster.local:{{ $rwPort }};
+      }
+
+      server {
+        listen 8080;
+        server_name _;
+
+        location = /healthz { return 200 "ok\n"; }
+
+        location = /api/v1/receive {
+          {{- if eq $method "basic" }}
+          auth_basic "thanos-ingest";
+          auth_basic_user_file /etc/nginx/auth/htpasswd;
+          {{- end }}
+          auth_request /_gate;
+          error_page 403 = @unauth;
+
+          # the client can NEVER choose its own tenant
+          proxy_set_header {{ $hdr }} $effective_tenant;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_pass http://receive_router;
+        }
+
+        location = /_gate {
+          internal;
+          if ($reject_unauth) { return 403; }
+          return 204;
+        }
+        location @unauth { return 401 "push authentication required\n"; }
+      }
+    }
+{{- end }}

@@ -1,0 +1,68 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $r := $cfg.receive -}}
+{{- if $r.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- $rwPort := $r.service.remoteWritePort | default 19291 -}}
+# Ingestion entrypoint — points at the stateless ROUTER / distributor pods.
+# Producers (Prometheus, Alloy, Ruler) only ever talk to this Service; they
+# never reach an ingester directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-receive
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receive-router
+spec:
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "receive-router") | nindent 4 }}
+  ports:
+    - { name: remote-write, port: {{ $rwPort }}, targetPort: remote-write }
+    - { name: http, port: 10902, targetPort: http }
+---
+# Headless — StoreAPI discovery (Query) + stable pod DNS for the hashring.
+# Selects the INGESTERS (the StatefulSet holding the TSDB).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-receive-headless
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receive
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "receive") | nindent 4 }}
+  ports:
+    - { name: grpc, port: 10901, targetPort: grpc }
+    - { name: http, port: 10902, targetPort: http }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}-receive
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receive
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "receive") | nindent 6 }}
+{{- if gt (int $r.router.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}-receive-router
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receive-router
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "receive-router") | nindent 6 }}
+{{- end }}
+{{- end }}

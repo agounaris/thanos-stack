@@ -1,0 +1,24 @@
+# Owner: platform / checkout
+groups:
+  - name: checkout.alerts
+    rules:
+      - alert: CheckoutHighErrorRatio
+        expr: service:checkout_request_errors:ratio5m > 0.02
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+          service: checkout
+        annotations:
+          summary: "checkout {{ $labels.route }} error ratio {{ $value | humanizePercentage }}"
+          runbook_url: https://runbooks.example.com/checkout/high-error-ratio
+
+      - alert: CheckoutLatencyP99High
+        expr: service:checkout_latency:p99_5m > 1.5
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+          service: checkout
+        annotations:
+          summary: "checkout p99 latency {{ $value }}s on {{ $labels.route }}"

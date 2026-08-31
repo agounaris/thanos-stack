@@ -1,0 +1,10 @@
+# Owner: data / etl
+groups:
+  - name: etl.alerts
+    rules:
+      - alert: EtlPipelineStalled
+        expr: job:etl_rows_processed:rate5m == 0
+        for: 30m
+        labels: { severity: critical, team: data, service: etl }
+        annotations:
+          summary: "ETL pipeline {{ $labels.pipeline }} has processed no rows for 30m"

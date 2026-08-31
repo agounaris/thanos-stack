@@ -1,0 +1,122 @@
+# Small Grafana with two provisioned datasources, both pointing at the
+# tenant-gateway — they differ only by the Basic-auth credential, which is what
+# selects the tenant:
+#   "Thanos — default"  -> user `shared` -> tenant __no_tenant__
+#   "Thanos — acme"      -> user `acme`    -> tenant acme   (isDefault)
+#
+#   kubectl apply -f grafana.yaml
+#   kubectl -n default port-forward svc/grafana 3000:3000
+#   open http://localhost:3000   (anonymous Admin; or admin / admin-secret)
+#
+# Passwords come from the thanos-tenant-htpasswd flow — here we also need the
+# plaintext, so this Secret carries it. Rotate/replace for anything real.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-ds-creds
+  namespace: default
+type: Opaque
+stringData:
+  SHARED_PW: shared-secret
+  ACME_PW: acme-secret
+  ADMIN_PW: admin-secret
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: default
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Thanos — default
+        type: prometheus
+        access: proxy
+        url: http://thanos-stack-tenant-gateway.default.svc.cluster.local:10902
+        uid: thanos-default
+        basicAuth: true
+        basicAuthUser: shared
+        jsonData:
+          httpMethod: POST
+          prometheusType: Thanos
+          timeInterval: 30s
+        secureJsonData:
+          basicAuthPassword: ${SHARED_PW}
+      - name: Thanos — acme
+        type: prometheus
+        access: proxy
+        isDefault: true
+        url: http://thanos-stack-tenant-gateway.default.svc.cluster.local:10902
+        uid: thanos-acme
+        basicAuth: true
+        basicAuthUser: acme
+        jsonData:
+          httpMethod: POST
+          prometheusType: Thanos
+          timeInterval: 30s
+        secureJsonData:
+          basicAuthPassword: ${ACME_PW}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: default
+  labels: { app: grafana }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata:
+      labels: { app: grafana }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 472, fsGroup: 472 }
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          ports: [{ name: http, containerPort: 3000 }]
+          env:
+            - { name: GF_SECURITY_ADMIN_PASSWORD, valueFrom: { secretKeyRef: { name: grafana-ds-creds, key: ADMIN_PW } } }
+            - { name: SHARED_PW, valueFrom: { secretKeyRef: { name: grafana-ds-creds, key: SHARED_PW } } }
+            - { name: ACME_PW,    valueFrom: { secretKeyRef: { name: grafana-ds-creds, key: ACME_PW } } }
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Admin" }
+            - { name: GF_USERS_DEFAULT_THEME, value: "light" }
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/grafana }
+            - { name: provisioning, mountPath: /etc/grafana/provisioning/datasources }
+      volumes:
+        - { name: data, emptyDir: {} }
+        - { name: provisioning, configMap: { name: grafana-provisioning } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: default
+  labels: { app: grafana }
+spec:
+  selector: { app: grafana }
+  ports: [{ name: http, port: 3000, targetPort: http }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: default
+  labels: { app: grafana }
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: grafana, port: { number: 3000 } } }

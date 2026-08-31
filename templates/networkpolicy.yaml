@@ -1,0 +1,88 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml }}
+{{- $fn := include "thanos-stack.fullname" . }}
+{{- $sel := include "thanos-stack.name" . }}
+# Allow all intra-stack traffic (any thanos-stack pod -> any thanos-stack pod).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-internal
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $sel }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $sel }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- with .Values.serviceMonitor }}
+    {{- if .enabled }}
+    # scrape traffic — adjust namespace/labels to your Prometheus
+    - ports:
+        - { protocol: TCP, port: 10902 }
+    {{- end }}
+    {{- end }}
+{{- with .Values.networkPolicy.extraIngress }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-ingest-and-read
+  labels:
+    {{- include "thanos-stack.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [receive, receive-router, query-frontend, query]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}
+{{- if and .Values.multiTenancy.enabled .Values.multiTenancy.networkPolicy .Values.multiTenancy.gateway.enabled }}
+{{- $fn := include "thanos-stack.fullname" . }}
+{{- $sel := include "thanos-stack.name" . }}
+---
+# Multi-tenancy: reads may only enter through the tenant-gateway. Anything that
+# reaches query / query-frontend directly could pick its own tenant.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-tenant-isolation
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/name, operator: In, values: [{{ $sel }}] }
+      - { key: app.kubernetes.io/component, operator: In, values: [query, query-frontend] }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        # the gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $sel }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: tenant-gateway
+        # ruler (queries with its own per-shard tenant header) + query itself
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/name, operator: In, values: [{{ $sel }}] }
+              - { key: app.kubernetes.io/component, operator: In, values: [ruler, query] }
+        {{- range .Values.multiTenancy.trustedDirectClients }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 10902 }
+        - { protocol: TCP, port: 10901 }
+{{- end }}

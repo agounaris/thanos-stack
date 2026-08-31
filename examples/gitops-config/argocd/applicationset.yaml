@@ -1,0 +1,32 @@
+# One ArgoCD Application per service directory. The git-directory generator
+# discovers config/<group>/<service>/ automatically — add a folder, get an app.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: thanos-stack-config
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - git:
+        repoURL: https://github.com/your-org/observability-config.git
+        revision: main
+        directories:
+          - path: config/*/*
+  template:
+    metadata:
+      name: 'tsc-{{ index (splitList "/" .path.path) 1 }}-{{ .path.basename }}'
+    spec:
+      project: observability
+      source:
+        repoURL: https://github.com/your-org/observability-config.git
+        targetRevision: main
+        path: '{{ .path.path }}'
+        plugin:
+          name: thanos-stack-config     # runs render/build.sh for this dir
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: default              # where the ruler runs
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+        syncOptions: [CreateNamespace=false]

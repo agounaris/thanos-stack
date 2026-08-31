@@ -1,0 +1,57 @@
+{{- if .Values.ingress.enabled }}
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml }}
+{{- $fn := include "thanos-stack.fullname" . }}
+{{- $ing := .Values.ingress }}
+{{- $mt := .Values.multiTenancy }}
+{{- $readSvc := printf "%s-query-frontend" $fn }}
+{{- if and $mt.enabled $mt.gateway.enabled }}{{ $readSvc = printf "%s-tenant-gateway" $fn }}{{ end }}
+{{- $writeSvc := printf "%s-receive" $fn }}
+{{- if and $mt.enabled $mt.ingestGateway.enabled }}{{ $writeSvc = printf "%s-ingest-gateway" $fn }}{{ end }}
+{{- $routes := list }}
+{{- if and $ing.queryFrontend.host $cfg.queryFrontend.enabled }}
+{{-   $routes = append $routes (dict "name" "query-frontend" "svc" $readSvc "port" 10902 "r" $ing.queryFrontend) }}
+{{- end }}
+{{- if and $ing.query.host $cfg.query.enabled }}
+{{-   $routes = append $routes (dict "name" "query" "svc" (printf "%s-query" $fn) "port" 10902 "r" $ing.query) }}
+{{- end }}
+{{- if and $ing.receive.host $cfg.receive.enabled }}
+{{-   $routes = append $routes (dict "name" "receive" "svc" $writeSvc "port" ($cfg.receive.service.remoteWritePort | default 19291) "r" $ing.receive) }}
+{{- end }}
+{{- if and $ing.ruler.host $cfg.ruler.enabled }}
+{{-   $firstShard := (index (include "thanos-stack.rulerShards" . | fromYamlArray) 0).name }}
+{{-   $routes = append $routes (dict "name" "ruler" "svc" (printf "%s-ruler-%s-headless" $fn $firstShard) "port" 10902 "r" $ing.ruler) }}
+{{- end }}
+{{- range $route := $routes }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fn }}-{{ $route.name }}
+  labels:
+    {{- include "thanos-stack.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $route.name }}
+  {{- with $ing.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $ing.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $ing.tls }}
+  tls:
+    {{- toYaml $ing.tls | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ $route.r.host | quote }}
+      http:
+        paths:
+          - path: {{ $route.r.path | default "/" }}
+            pathType: {{ $route.r.pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $route.svc }}
+                port:
+                  number: {{ $route.port }}
+{{- end }}
+{{- end }}

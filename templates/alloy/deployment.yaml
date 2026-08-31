@@ -1,0 +1,100 @@
+{{- if .Values.alloy.enabled }}
+{{- $fn := include "thanos-stack.fullname" . }}
+{{- $a := .Values.alloy }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-alloy
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: alloy
+spec:
+  replicas: {{ $a.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "alloy") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thanos-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: alloy
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/alloy/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ $fn }}-alloy
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 473
+        runAsGroup: 473
+        fsGroup: 473
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alloy
+          image: "{{ $a.image.repository }}:{{ $a.image.tag }}"
+          imagePullPolicy: {{ $a.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --storage.path=/tmp/alloy
+          ports:
+            - { name: http, containerPort: 12345 }
+            {{- if $a.otlp.enabled }}
+            - { name: otlp-grpc, containerPort: {{ $a.otlp.grpcPort | default 4317 }} }
+            - { name: otlp-http, containerPort: {{ $a.otlp.httpPort | default 4318 }} }
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet: { path: /-/ready, port: http }
+            initialDelaySeconds: 30
+          {{- with $a.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/alloy }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fn }}-alloy
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-alloy
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: alloy
+spec:
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "alloy") | nindent 4 }}
+  ports:
+    - { name: http, port: 12345, targetPort: http }
+    {{- if $a.otlp.enabled }}
+    - { name: otlp-grpc, port: {{ $a.otlp.grpcPort | default 4317 }}, targetPort: otlp-grpc }
+    - { name: otlp-http, port: {{ $a.otlp.httpPort | default 4318 }}, targetPort: otlp-http }
+    {{- end }}
+{{- end }}

@@ -1,0 +1,50 @@
+# --- Probe: blackbox HTTP checks against the Thanos read endpoints ---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: thanos-endpoints
+  namespace: default
+  labels: { release: kps }
+spec:
+  interval: 30s
+  module: http_2xx
+  prober:
+    url: blackbox-prometheus-blackbox-exporter.monitoring.svc.cluster.local:9115
+  targets:
+    staticConfig:
+      static:
+        - http://thanos-stack-query-frontend.default.svc.cluster.local:10902/-/healthy
+        - http://thanos-stack-query.default.svc.cluster.local:10902/-/healthy
+        - http://thanos-stack-receive.default.svc.cluster.local:10902/-/healthy
+      labels:
+        probe_group: thanos-stack
+---
+# --- PodMonitor: scrape the MinIO pod directly by pod (no Service needed) ---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: minio
+  namespace: default
+  labels: { release: kps }
+spec:
+  selector:
+    matchLabels: { app: minio }
+  podMetricsEndpoints:
+    - port: s3
+      path: /minio/v2/metrics/cluster
+      interval: 30s
+---
+# --- ScrapeConfig CRD: a plain static scrape job managed as a CR ---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: alloy-self
+  namespace: default
+  labels: { release: kps }
+spec:
+  scrapeInterval: 30s
+  staticConfigs:
+    - targets:
+        - thanos-stack-alloy.default.svc.cluster.local:12345
+      labels:
+        source: scrapeConfigCRD

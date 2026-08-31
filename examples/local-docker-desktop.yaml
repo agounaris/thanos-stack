@@ -1,0 +1,172 @@
+# Full stack on a laptop (Docker Desktop / kind / minikube), default namespace.
+# Exercises every component + time-sharded store + sharded ruler + ingress,
+# with resources shrunk to fit ~6 CPU / 12Gi. NOT a sizing reference.
+#
+#   kubectl apply -f minio.yaml            # any S3-compatible bucket
+#   helm install thanos-stack ./thanos-helm-chart -n default \
+#     -f examples/local-docker-desktop.yaml
+#
+#   curl -H 'Host: thanos.local'       http://localhost/-/healthy
+#   curl -H 'Host: thanos-query.local' http://localhost/-/healthy
+
+size: small
+
+# Self-contained: bundle a Grafana Alloy collector so the stack has real data
+# to serve the moment it's up (kubelet, cadvisor, apiserver, this stack itself).
+alloy:
+  enabled: true
+  tenant: infra
+  scrape:
+    interval: 30s
+
+# Emit ServiceMonitors + a PrometheusRule for the stack. Needs the Prometheus
+# Operator CRDs installed (e.g. kube-prometheus-stack).
+multiTenancy:
+  enabled: true
+  onMissingTenant: reject
+  tenants:
+    - name: infra                       # the stack's own Alloy metrics
+    - name: acme
+      limits: { request: { series_limit: 500000 } }
+    - name: globex
+      limits: { request: { series_limit: 100000 } }
+  gateway:
+    enabled: true
+    replicas: 1
+    auth:
+      method: basic
+      existingSecret: thanos-tenant-htpasswd
+
+serviceMonitor:
+  enabled: true
+prometheusRule:
+  enabled: true
+
+objstore:
+  config:
+    type: S3
+    config:
+      bucket: thanos
+      endpoint: minio.default.svc.cluster.local:9000
+      insecure: true
+      access_key: thanos
+      secret_key: thanos12345
+
+externalLabels:
+  cluster: docker-desktop
+
+retention:
+  raw: 7d
+  fiveMinutes: 30d
+  oneHour: 90d
+
+podAntiAffinity:
+  enabled: true
+  type: soft
+
+ingress:
+  enabled: true
+  className: nginx
+  queryFrontend:
+    host: thanos.local
+  query:
+    host: thanos-query.local
+  ruler:
+    host: thanos-ruler.local
+
+overrides:
+  receive:
+    router:
+      replicas: 2
+      resources:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 256Mi }
+    replicas: 2
+    replicationFactor: 2
+    localRetention: 2d
+    persistence: { size: 2Gi }
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 768Mi }
+    limitsConfig:
+      write:
+        global: { max_concurrency: 30 }
+        default:
+          request:
+            size_bytes_limit: 8388608
+    relabelConfig:
+      - action: labeldrop
+        regex: "pod_template_hash|controller_revision_hash|apps_kubernetes_io_pod_index"
+
+  storeGateway:
+    timeShards:
+      - { name: recent, minTime: "-3d", maxTime: "" }
+      - { name: historical, minTime: "", maxTime: "-3d" }
+    replicasPerShard: 1
+    persistence: { size: 1Gi }
+    resources:
+      requests: { cpu: 100m, memory: 384Mi }
+      limits: { memory: 640Mi }
+  compactor:
+    persistence: { size: 5Gi }
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 768Mi }
+  query:
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 768Mi }
+  queryFrontend:
+    replicas: 2
+    cache: { type: inmemory, inmemory: { maxSize: 64MB } }
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 192Mi }
+  ruler:
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { memory: 384Mi }
+
+ruler:
+  mode: statefulset
+  evalInterval: 30s
+  dynamicRules:
+    enabled: true
+    labelSelector: "thanos-stack.io/rule=true"
+    namespaces: "ALL"
+  alertmanagers:
+    # kube-prometheus-stack's Alertmanager (adjust if you named the release differently)
+    - http://kps-alertmanager.monitoring.svc.cluster.local:9093
+  ruleFiles:
+    platform-recording.yaml: |
+      groups:
+        - name: platform.recording
+          interval: 30s
+          rules:
+            - record: job:up:count
+              expr: count by (job) (up)
+    platform-alerts.yaml: |
+      groups:
+        - name: platform.alerts
+          rules:
+            - alert: TargetDown
+              expr: up == 0
+              for: 2m
+              labels: { severity: warning }
+              annotations:
+                summary: "{{ $labels.job }} / {{ $labels.instance }} is down"
+    apps-recording.yaml: |
+      groups:
+        - name: apps.recording
+          interval: 30s
+          rules:
+            - record: job:scrape_samples:sum
+              expr: sum by (job) (scrape_samples_scraped)
+  shards:
+    - name: platform
+      replicas: 1
+      ruleFileKeys: [platform-recording.yaml, platform-alerts.yaml]
+    - name: apps
+      replicas: 1
+      ruleFileKeys: [apps-recording.yaml]

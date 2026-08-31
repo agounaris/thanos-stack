@@ -1,0 +1,42 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $ruler := $cfg.ruler -}}
+{{- if and $ruler.enabled $ruler.dynamicRules.enabled }}
+{{- $fn := include "thanos-stack.fullname" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fn }}-ruler
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ruler
+automountServiceAccountToken: true
+---
+{{- $clusterWide := eq ($ruler.dynamicRules.namespaces | default "ALL") "ALL" }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ if $clusterWide }}ClusterRole{{ else }}Role{{ end }}
+metadata:
+  name: {{ $fn }}-ruler-rules-reader
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ruler
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ if $clusterWide }}ClusterRoleBinding{{ else }}RoleBinding{{ end }}
+metadata:
+  name: {{ $fn }}-ruler-rules-reader
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ruler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ if $clusterWide }}ClusterRole{{ else }}Role{{ end }}
+  name: {{ $fn }}-ruler-rules-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fn }}-ruler
+    namespace: {{ .Release.Namespace }}
+{{- end }}

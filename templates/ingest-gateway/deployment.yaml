@@ -1,0 +1,124 @@
+{{- $mt := .Values.multiTenancy -}}
+{{- if and $mt.enabled $mt.ingestGateway.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- $g := $mt.ingestGateway -}}
+{{- $rwPort := (include "thanos-stack.cfg" . | fromYaml).receive.service.remoteWritePort | default 19291 -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-ingest-gateway
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingest-gateway
+spec:
+  replicas: {{ $g.replicas | default 2 }}
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "ingest-gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thanos-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ingest-gateway
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/ingest-gateway/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "thanos-stack.serviceAccountName" . }}
+      securityContext:
+        {{- include "thanos-stack.podSecurityContext" . | nindent 8 }}
+      {{- include "thanos-stack.podHardening" (dict "ctx" . "component" "ingest-gateway") | nindent 6 }}
+      containers:
+        - name: nginx
+          image: {{ $g.image }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          {{- with $g.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true }
+            {{- if and (eq ($g.auth.method | default "mtls") "basic") $g.auth.existingSecret }}
+            - { name: htpasswd, mountPath: /etc/nginx/auth, readOnly: true }
+            {{- end }}
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fn }}-ingest-gateway
+        {{- if and (eq ($g.auth.method | default "mtls") "basic") $g.auth.existingSecret }}
+        - name: htpasswd
+          secret:
+            secretName: {{ $g.auth.existingSecret }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-ingest-gateway
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingest-gateway
+spec:
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "ingest-gateway") | nindent 4 }}
+  ports:
+    - { name: remote-write, port: {{ $rwPort }}, targetPort: http }
+    - { name: http, port: 10902, targetPort: http }
+{{- if gt (int ($g.replicas | default 2)) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}-ingest-gateway
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingest-gateway
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "ingest-gateway") | nindent 6 }}
+{{- end }}
+{{- if $g.networkPolicy }}
+---
+# Only the ingest-gateway (and the ruler, for stateless remote_write) may reach
+# receive-router's remote-write port. Producers must go through the gateway.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-ingest-isolation
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "receive-router") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "thanos-stack.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: ingest-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "thanos-stack.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: ruler
+      ports:
+        - { protocol: TCP, port: {{ $rwPort }} }
+    # scrape traffic to the router's /metrics
+    - ports:
+        - { protocol: TCP, port: 10902 }
+{{- end }}
+{{- end }}

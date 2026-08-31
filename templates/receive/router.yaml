@@ -1,0 +1,104 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $r := $cfg.receive -}}
+{{- if $r.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+# Stateless router / distributor tier. Terminates remote-write, hashring-routes
+# each series to `replicationFactor` ingesters. No TSDB, no object storage.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-receive-router
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receive-router
+spec:
+  replicas: {{ $r.router.replicas }}
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "receive-router") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thanos-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: receive-router
+      annotations:
+        checksum/hashring: {{ include (print $.Template.BasePath "/receive/hashring.yaml") . | sha256sum }}
+        checksum/limits: {{ toYaml ($r.limitsConfig | default dict) | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "thanos-stack.serviceAccountName" . }}
+      securityContext:
+        {{- include "thanos-stack.podSecurityContext" . | nindent 8 }}
+      {{- include "thanos-stack.podHardening" (dict "ctx" . "component" "receive-router") | nindent 6 }}
+      containers:
+        - name: router
+          image: {{ include "thanos-stack.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" . | nindent 12 }}
+          args:
+            - receive
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            - --remote-write.address=0.0.0.0:19291
+            {{- if $.Values.multiTenancy.enabled }}
+            - --receive.tenant-header={{ $.Values.multiTenancy.tenantHeader }}
+            - --receive.tenant-label-name={{ $.Values.multiTenancy.tenantLabel }}
+            - --receive.default-tenant-id={{ $.Values.multiTenancy.defaultTenant }}
+            {{- if $.Values.multiTenancy.splitTenantLabel }}
+            - --receive.split-tenant-label-name={{ $.Values.multiTenancy.splitTenantLabel }}
+            {{- end }}
+            {{- end }}
+            - --receive.hashrings-file=/etc/thanos/hashring/hashring.json
+            - --receive.hashrings-algorithm=ketama
+            - --receive.replication-factor={{ $r.replicationFactor }}
+            - --label=receive_router="1"
+            {{- include "thanos-stack.externalLabelArgs" . | nindent 12 }}
+            {{- if (include "thanos-stack.receiveHasLimits" $) }}
+            - --receive.limits-config-file=/etc/thanos/limits/limits.yml
+            {{- end }}
+            {{- with $r.relabelConfig }}
+            - {{ printf "--receive.relabel-config=%s" (toJson .) | quote }}
+            {{- end }}
+            {{- range $r.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - { name: grpc, containerPort: 10901 }
+            - { name: http, containerPort: 10902 }
+            - { name: remote-write, containerPort: 19291 }
+          startupProbe:
+            httpGet: { path: /-/ready, port: http }
+            failureThreshold: 40
+            periodSeconds: 3
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 30
+          {{- with $r.router.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: hashring, mountPath: /etc/thanos/hashring }
+            - { name: tmp, mountPath: /tmp }
+            {{- if (include "thanos-stack.receiveHasLimits" $) }}
+            - { name: limits, mountPath: /etc/thanos/limits, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: hashring
+          configMap:
+            name: {{ $fn }}-receive-hashring
+        - name: tmp
+          emptyDir: {}
+        {{- if (include "thanos-stack.receiveHasLimits" $) }}
+        - name: limits
+          configMap:
+            name: {{ $fn }}-receive-limits
+        {{- end }}
+{{- end }}

@@ -1,0 +1,111 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $c := $cfg.compactor -}}
+{{- if $c.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- if and (gt (int ($c.replicas | default 1)) 1) (not $c.iKnowCompactorMustBeSingleton) -}}
+{{- fail "compactor: more than one replica per bucket corrupts data. Shard with a --selector.relabel-config (compactor.extraArgs) and set compactor.iKnowCompactorMustBeSingleton=true." -}}
+{{- end -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-compactor
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: compactor
+spec:
+  clusterIP: None
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "compactor") | nindent 4 }}
+  ports:
+    - { name: http, port: 10902, targetPort: http }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fn }}-compactor
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: compactor
+spec:
+  replicas: {{ $c.replicas | default 1 }}
+  serviceName: {{ $fn }}-compactor
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "compactor") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thanos-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: compactor
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "thanos-stack.serviceAccountName" . }}
+      securityContext:
+        {{- include "thanos-stack.podSecurityContext" . | nindent 8 }}
+      {{- include "thanos-stack.podHardening" (dict "ctx" . "component" "compactor" "terminationGracePeriodSeconds" 120) | nindent 6 }}
+      containers:
+        - name: compactor
+          image: {{ include "thanos-stack.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" . | nindent 12 }}
+          args:
+            - compact
+            - --wait
+            - --wait-interval=5m
+            - --http-address=0.0.0.0:10902
+            - --data-dir=/var/thanos/compact
+            - --retention.resolution-raw={{ .Values.retention.raw }}
+            - --retention.resolution-5m={{ .Values.retention.fiveMinutes }}
+            - --retention.resolution-1h={{ .Values.retention.oneHour }}
+            - --compact.concurrency={{ $c.concurrency | default 1 }}
+            - --delete-delay=48h
+            {{- range $c.extraArgs }}
+            - {{ . }}
+            {{- end }}
+            - {{ include "thanos-stack.objstoreArg" . }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - { name: http, containerPort: 10902 }
+          startupProbe:
+            httpGet: { path: /-/ready, port: http }
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 30
+          {{- with $c.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: data, mountPath: /var/thanos/compact }
+            - { name: tmp, mountPath: /tmp }
+            {{- include "thanos-stack.objstoreVolumeMount" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- include "thanos-stack.objstoreVolume" . | nindent 8 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if $c.persistence.storageClass }}
+        storageClassName: {{ $c.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $c.persistence.size }}
+{{- end }}

@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: tenant-agent, namespace: default }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: tenant-agent }
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, pods, endpoints, services]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/metrics"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: tenant-agent }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: tenant-agent }
+subjects: [{ kind: ServiceAccount, name: tenant-agent, namespace: default }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: agent-acme, namespace: default }
+data:
+  prometheus.yml: |
+    global: { scrape_interval: 15s, external_labels: { env: acme-prod } }
+    remote_write:
+      # go through the INGEST GATEWAY with Basic auth — the gateway sets
+      # THANOS-TENANT from the `acme` login (any header we send is overwritten).
+      - url: http://thanos-stack-ingest-gateway.default.svc.cluster.local:19291/api/v1/receive
+        basic_auth: { username: acme, password: acme-secret }
+    scrape_configs:
+      - job_name: acme-workloads
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [default] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_part_of]
+            regex: thanos
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: http
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: agent-globex, namespace: default }
+data:
+  prometheus.yml: |
+    global: { scrape_interval: 15s, external_labels: { env: globex-prod } }
+    remote_write:
+      - url: http://thanos-stack-ingest-gateway.default.svc.cluster.local:19291/api/v1/receive
+        basic_auth: { username: globex, password: globex-secret }
+    scrape_configs:
+      - job_name: globex-kube
+        kubernetes_sd_configs: [{ role: endpoints, namespaces: { names: [monitoring, kube-system] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            regex: (kps-kube-state-metrics|kube-dns)
+            action: keep
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: agent-acme, namespace: default, labels: { app: agent-acme } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: agent-acme } }
+  template:
+    metadata: { labels: { app: agent-acme } }
+    spec:
+      serviceAccountName: tenant-agent
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          args: [--config.file=/etc/prometheus/prometheus.yml, --agent, --storage.agent.path=/data]
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: config, configMap: { name: agent-acme } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: agent-globex, namespace: default, labels: { app: agent-globex } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: agent-globex } }
+  template:
+    metadata: { labels: { app: agent-globex } }
+    spec:
+      serviceAccountName: tenant-agent
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          args: [--config.file=/etc/prometheus/prometheus.yml, --agent, --storage.agent.path=/data]
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: config, configMap: { name: agent-globex } }
+        - { name: data, emptyDir: {} }

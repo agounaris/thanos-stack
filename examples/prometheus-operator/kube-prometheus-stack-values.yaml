@@ -1,0 +1,77 @@
+fullnameOverride: kps
+
+crds:
+  enabled: true
+
+grafana:
+  enabled: false
+
+kubeStateMetrics:
+  enabled: true
+nodeExporter:
+  enabled: true
+prometheus-node-exporter:
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { memory: 64Mi }
+
+kube-state-metrics:
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { memory: 128Mi }
+
+prometheusOperator:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    replicas: 1
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits: { memory: 128Mi }
+
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 3h
+    scrapeInterval: 30s
+    # discover ALL of these across ALL namespaces (not just this release's own)
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorSelector: {}
+    podMonitorSelector: {}
+    probeSelector: {}
+    scrapeConfigSelector: {}
+    ruleSelector: {}
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+    probeNamespaceSelector: {}
+    scrapeConfigNamespaceSelector: {}
+    ruleNamespaceSelector: {}
+    resources:
+      requests: { cpu: 250m, memory: 768Mi }
+      limits: { memory: 1536Mi }
+    # push everything it scrapes into the thanos-stack ingestion path
+    remoteWrite:
+      - url: http://thanos-stack-receive.default.svc.cluster.local:19291/api/v1/receive
+    externalLabels:
+      cluster: docker-desktop
+      prometheus_replica: kps-0
+    # raw scrape config (rendered into a Secret by the chart)
+    additionalScrapeConfigs:
+      - job_name: additional-static-demo
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - thanos-stack-query-frontend.default.svc.cluster.local:10902
+            labels:
+              source: additionalScrapeConfigs
+
+nodeExporter:
+  enabled: false

@@ -1,0 +1,27 @@
+# Owner: platform / checkout
+# Scrape configuration for this service. Rendered into a Prometheus Operator
+# ScrapeConfig (or appended to additionalScrapeConfigs) by the pipeline.
+# Everything scraped is remote_written into Thanos Receive by the collector.
+scrape_configs:
+  - job_name: checkout
+    scrape_interval: 30s
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [checkout]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: checkout
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: metrics
+        action: keep
+      - target_label: team
+        replacement: platform
+      - target_label: service
+        replacement: checkout
+    # per-target guard rails (see PROTECTION.md)
+    label_limit: 40
+    label_name_length_limit: 200
+    label_value_length_limit: 2048
+    sample_limit: 100000

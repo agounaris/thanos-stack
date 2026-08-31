@@ -1,0 +1,33 @@
+thanos-stack "{{ .Release.Name }}" deployed at size: {{ .Values.size }}
+
+Push metrics to Thanos Receive:
+  remote_write:
+    - url: http://{{ include "thanos-stack.fullname" . }}-receive.{{ .Release.Namespace }}.svc.cluster.local:19291/api/v1/receive
+
+Query API / UI (put an Ingress in front of query-frontend):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "thanos-stack.fullname" . }}-query-frontend 10902:10902
+  open http://localhost:10902
+{{- if .Values.ingress.enabled }}
+{{- range $k, $v := dict "queryFrontend" .Values.ingress.queryFrontend.host "query" .Values.ingress.query.host "ruler" .Values.ingress.ruler.host "receive" .Values.ingress.receive.host }}
+{{- if $v }}
+  ingress {{ $k }}: http://{{ $v }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.alloy.enabled }}
+
+Grafana Alloy is bundled — it is already scraping the common Kubernetes
+endpoints and remote-writing into Receive. Check what landed:
+  curl -s 'http://<query-frontend>/api/v1/query?query=count%20by%20(job)%20(up{collector="grafana-alloy"})'
+{{- end }}
+
+{{- if not (or .Values.objstore.existingSecret .Values.objstore.config) }}
+
+WARNING: no object storage configured. Set objstore.existingSecret or objstore.config.
+{{- end }}
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml }}
+{{- if and $cfg.ruler.enabled (not $cfg.ruler.alertmanagers) }}
+
+NOTE: ruler is enabled but ruler.alertmanagers is empty — alerting rules will
+      evaluate but fire nowhere. See RULES.md.
+{{- end }}

@@ -1,0 +1,38 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $ruler := $cfg.ruler -}}
+{{- if $ruler.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+{{- range $key, $body := ($ruler.ruleFiles | default dict) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-ruler-rules-{{ regexReplaceAll "[^a-zA-Z0-9]+" $key "-" | trimSuffix "-" | lower }}
+  labels:
+    {{- include "thanos-stack.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: ruler
+    thanos.io/rule-file: {{ $key | quote }}
+data:
+  {{ $key }}: |
+    {{- $body | nindent 4 }}
+{{- end }}
+{{- if eq ($ruler.mode | default "statefulset") "stateless" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-ruler-remote-write
+  labels:
+    {{- include "thanos-stack.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: ruler
+data:
+  remote-write.yml: |
+    remote_write:
+      - url: http://{{ $fn }}-receive.{{ $.Release.Namespace }}.svc.cluster.local:{{ $cfg.receive.service.remoteWritePort | default 19291 }}/api/v1/receive
+        name: thanos-ruler
+        remote_timeout: 30s
+        queue_config:
+          capacity: 10000
+          max_samples_per_send: 2000
+{{- end }}
+{{- end }}

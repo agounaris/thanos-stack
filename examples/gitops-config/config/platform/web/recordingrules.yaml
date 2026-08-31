@@ -1,0 +1,7 @@
+# Owner: platform / web
+groups:
+  - name: web.recording
+    interval: 30s
+    rules:
+      - record: service:web_requests:rate5m
+        expr: sum by (route) (rate(web_http_requests_total[5m]))

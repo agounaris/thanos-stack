@@ -1,0 +1,471 @@
+# =============================================================================
+# thanos-stack — the only two things most users touch: `size` and `objstore`
+# =============================================================================
+
+# T-shirt size. One of: small | medium | large | xl | xxl | custom
+# Each size selects a profile (see templates/_profiles.tpl) that sets replicas,
+# resources, PVC sizes, store-gateway time shards and the receive replication
+# factor. `custom` starts from nothing — you provide everything under `overrides`.
+#
+#   size    ~samples/s   ~active series (30s scrape)
+#   small       17k          ~0.5M
+#   medium      35k          ~1M
+#   large       70k          ~2.5M
+#   xl          120k         ~4M
+#   xxl         170k         ~5M+
+size: medium
+
+# Targeted overrides merged ON TOP of the selected profile (deep merge, maps
+# only — lists replace). Use for one-off tuning without leaving a named size:
+#   overrides:
+#     receive:
+#       replicas: 5
+#     storeGateway:
+#       timeShards:
+#         - { name: recent, minTime: "-30d", maxTime: "" }
+#         - { name: deep,   minTime: "",     maxTime: "-30d" }
+overrides: {}
+
+# -----------------------------------------------------------------------------
+# Object storage — REQUIRED. Every persistent component reads/writes this bucket.
+# -----------------------------------------------------------------------------
+objstore:
+  # Option A: point at a Secret you already manage. Its key must contain a
+  # Thanos objstore.yml document (https://thanos.io/tip/thanos/storage.md).
+  existingSecret: ""
+  existingSecretKey: objstore.yml
+
+  # Option B: let the chart create the Secret from this inline config.
+  config: {}
+  # config:
+  #   type: S3
+  #   config:
+  #     bucket: thanos
+  #     endpoint: s3.eu-west-1.amazonaws.com
+  #     region: eu-west-1
+  #     # credentials: prefer IRSA / workload identity over static keys
+
+# -----------------------------------------------------------------------------
+# External labels — stamped onto blocks written by receive and ruler. The
+# compactor selects blocks by these labels, so keep them stable & unique per
+# stack writing into the bucket.
+# -----------------------------------------------------------------------------
+externalLabels:
+  cluster: default
+
+# Downsampling + retention, enforced by the compactor.
+retention:
+  raw: 30d
+  fiveMinutes: 90d
+  oneHour: 1y
+
+# -----------------------------------------------------------------------------
+# Image / common settings
+# -----------------------------------------------------------------------------
+image:
+  repository: quay.io/thanos/thanos
+  tag: ""                 # defaults to .Chart.appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Emit ServiceMonitor objects (needs the Prometheus Operator CRDs installed).
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+commonLabels: {}
+podAnnotations: {}
+priorityClassName: ""
+extraEnv: []                    # extra env vars added to every Thanos container
+
+# Scheduling (applied to every component).
+nodeSelector: {}
+tolerations: []
+affinity: {}                    # full override; wins over podAntiAffinity below
+podAntiAffinity:
+  enabled: true
+  type: soft                    # soft | hard
+  topologyKey: kubernetes.io/hostname
+topologySpreadConstraints: []
+
+# =============================================================================
+# Multi-tenancy. When enabled:
+#  - Receive stamps tenant_id from the THANOS-TENANT header (per-tenant limits).
+#  - Query runs with --query.enforce-tenancy: a caller only ever sees the tenant
+#    in its THANOS-TENANT header, even if it crafts {tenant_id="other"}.
+#  - Query-Frontend partitions its result cache per tenant.
+#  - A `tenant-gateway` (nginx) authenticates callers, maps identity -> tenant,
+#    injects THANOS-TENANT, and strips any client-supplied value. This is the
+#    ONLY component that decides a caller's tenant — never trust the client.
+# See MULTITENANCY.md.
+# =============================================================================
+multiTenancy:
+  enabled: false
+  tenantHeader: THANOS-TENANT
+  tenantLabel: tenant_id
+  # Receive --receive.split-tenant-label-name: when a write carries this label,
+  # Receive routes each series to that tenant (overrides the header). Used by the
+  # Alloy OTLP path (alloy.otlp) to multiplex tenants over one connection.
+  splitTenantLabel: __tenant__
+  # A request the gateway could not attach a tenant to:
+  #   reject  -> 400 at the gateway (recommended)
+  #   default -> fall through as `defaultTenant` (open/no-auth style)
+  onMissingTenant: reject
+  # Fallback tenant for Query/Receive when no header is present. Keep it a value
+  # NO writer uses, so a request that bypasses the gateway sees nothing rather
+  # than a real tenant's data. Pair with the multiTenancy NetworkPolicy.
+  defaultTenant: __no_tenant__
+  # Also restrict query / query-frontend ingress to the gateway (needs a CNI
+  # that enforces NetworkPolicy).
+  networkPolicy: true
+
+  # The allowlist. An identity that authenticates but maps to no tenant here
+  # gets 403. Each tenant may carry per-tenant ingest limits + retention.
+  tenants: []
+  #   - name: acme
+  #     limits:                         # -> receive limits-config write.tenants.acme
+  #       request: { series_limit: 200000, samples_limit: 2000000 }
+  #       head_series_limit: 3000000    # needs meta-monitoring, see PROTECTION.md
+  #   - name: globex
+  #     limits:
+  #       request: { series_limit: 50000 }
+
+  gateway:
+    enabled: true
+    replicas: 2
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+    auth:
+      # method: basic  -> nginx auth_basic against an htpasswd Secret
+      # method: mtls   -> client-cert CN is the tenant (expects TLS-terminating
+      #                   ingress passing the verified CN in a header)
+      # method: none   -> gateway only injects headers (put your own authn in front)
+      method: basic
+      # htpasswd Secret: key `htpasswd`, lines `‹user›:‹bcrypt›`. The username
+      # MUST equal the tenant name (or be mapped via userToTenant below).
+      existingSecret: ""
+      # optional explicit username -> tenant map (else username == tenant)
+      userToTenant: {}
+      # mtls: header the ingress sets with the verified client CN
+      mtlsCNHeader: ssl-client-subject-cn
+  # extra hosts allowed to bypass the gateway and reach query-frontend directly
+  # (e.g. an internal Grafana that sets THANOS-TENANT itself). Empty = none.
+  trustedDirectClients: []
+
+  # ----- WRITE path -----------------------------------------------------------
+  # Receive itself has NO tenant allowlist (see MULTITENANCY.md). This gateway
+  # sits in front of receive-router: it authenticates the PUSH client, maps
+  # identity -> tenant, sets THANOS-TENANT, and strips any client value. An
+  # identity that maps to no tenant is handled per `onUnauthenticated`.
+  ingestGateway:
+    enabled: false
+    replicas: 2
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+    # a push the gateway could not attach a real tenant to:
+    #   reject  -> 401 (only known tenants may write)   [recommended]
+    #   default -> accept, force tenant = `defaultTenant` (quarantine bucket)
+    onUnauthenticated: reject
+    auth:
+      # mtls  -> verified client-cert CN (in mtlsCNHeader) is the tenant; no cert
+      #          -> onUnauthenticated. Client cannot spoof (we ignore its header).
+      # basic -> htpasswd; always requires valid creds (onUnauthenticated=reject).
+      # none  -> TRUST the inbound THANOS-TENANT header (only safe if something
+      #          upstream already authenticated and sanitised it).
+      method: mtls
+      existingSecret: ""                 # basic: key `htpasswd`
+      userToTenant: {}
+      mtlsCNHeader: ssl-client-subject-cn
+    # also lock receive-router ingress to this gateway (needs a CNI that enforces)
+    networkPolicy: true
+
+# -----------------------------------------------------------------------------
+# Ingress. One controller, one host per exposed endpoint. All disabled by default.
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  tls: []                       # [{ secretName: thanos-tls, hosts: [thanos.example.com] }]
+  # Each endpoint: set `host` to expose it. path/pathType have sane defaults.
+  queryFrontend:
+    host: ""                    # main read path — Grafana / users
+    path: /
+    pathType: Prefix
+  query:
+    host: ""                    # raw Query UI/API (bypasses the frontend cache)
+    path: /
+    pathType: Prefix
+  receive:
+    host: ""                    # remote-write ingestion endpoint (secure it!)
+    path: /
+    pathType: Prefix
+  ruler:
+    host: ""                    # Ruler UI (rules/alerts status)
+    path: /
+    pathType: Prefix
+
+# NetworkPolicy — default-deny ingress per component with the minimum allowed
+# flows between Thanos components. Enable once you've confirmed your CNI enforces
+# them and set `extraIngress` for Prometheus / Grafana / Alertmanager sources.
+networkPolicy:
+  enabled: false
+  # extra selectors allowed to reach receive:19291 and query-frontend:10902
+  extraIngress: []
+
+# PrometheusRule with Thanos component health alerts (needs Prometheus Operator).
+prometheusRule:
+  enabled: false
+  labels: {}
+
+# =============================================================================
+# Per-component config.
+# Everything below is a DEFAULT that the selected size profile overwrites.
+# You normally do not edit this block — use `size` + `overrides`.
+# =============================================================================
+
+receive:
+  enabled: true
+  # Ingestion ALWAYS goes: producer -> router/distributor (stateless) -> ingester
+  # (StatefulSet, TSDB). Producers never address an ingester directly.
+  router:
+    replicas: 2
+    resources: {}
+  # ingesters
+  replicas: 3
+  # Each series is written to this many ingesters by the router. RF2 tolerates
+  # 1 ingester loss; RF3 tolerates 2. ~RF× the ingester storage + memory.
+  # Change only on a fresh install or a planned hashring migration.
+  replicationFactor: 2
+  # How long an ingester keeps data locally before it is only in the bucket.
+  # Bigger = more recent data served without the store gateway, bigger PVC.
+  localRetention: 15d
+  persistence:
+    size: 20Gi
+    storageClass: ""
+  resources: {}
+  extraArgs: []
+  service:
+    remoteWritePort: 19291
+
+  # --- ingest guard rails (see PROTECTION.md) --------------------------------
+  # Request-level limits, rendered to --receive.limits-config-file. Thanos does
+  # NOT cap per-series label count / length at ingest — enforce that at scrape
+  # time (alloy.limits / Prometheus label_limit) or with a validating proxy.
+  limitsConfig: {}
+  #   write:
+  #     global:
+  #       max_concurrency: 30
+  #     default:
+  #       request:
+  #         size_bytes_limit: 8388608     # reject remote-write bodies > 8 MiB
+  #         series_limit: 0               # max series per request (0 = off)
+  #         samples_limit: 0              # max samples per request (0 = off)
+  #     tenants: {}
+
+  # Relabel rules applied to every incoming series, rendered to
+  # --receive.relabel-config. Use to drop known-bad / high-cardinality labels
+  # or series. Cannot count labels.
+  relabelConfig: []
+  #   - action: labeldrop
+  #     regex: "pod_template_hash|controller_revision_hash"
+  #   - action: drop
+  #     source_labels: [__name__]
+  #     regex: "go_gc_.*"
+
+storeGateway:
+  enabled: true
+  # One StatefulSet per entry. Empty minTime/maxTime = open-ended.
+  # Thanos accepts relative durations ("-90d", "-2w") or RFC3339 timestamps.
+  # Overlap boundaries by a few hours so a block straddling one is always served.
+  timeShards:
+    - { name: all, minTime: "", maxTime: "" }
+  # replicas PER time shard (each replica loads the same blocks; for HA/QPS)
+  replicasPerShard: 1
+  persistence:
+    size: 10Gi        # local disk is CACHE ONLY, data lives in the bucket
+    storageClass: ""
+  resources: {}
+  extraArgs: []
+
+compactor:
+  enabled: true
+  # MUST be a singleton per bucket + externalLabels set. Do not raise this
+  # unless you also shard with a selector relabel-config (compactor.extraArgs).
+  replicas: 1
+  iKnowCompactorMustBeSingleton: false   # set true to allow replicas > 1
+  concurrency: 1
+  persistence:
+    size: 50Gi
+    storageClass: ""
+  resources: {}
+  extraArgs: []
+
+query:
+  enabled: true
+  replicas: 2
+  # Labels stripped during dedup. Defaults cover receive + ruler replica labels.
+  replicaLabels:
+    - replica
+    - ruler_replica
+    - receive_replica
+    - prometheus_replica
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  resources: {}
+  extraArgs: []
+
+queryFrontend:
+  enabled: true
+  replicas: 1
+  splitInterval: 24h
+  maxRetries: 5
+  logQueriesLongerThan: 10s
+  cache:
+    type: inmemory            # inmemory | memcached
+    inmemory:
+      maxSize: 512MB
+    memcached:
+      addresses: []           # ["dnssrv+_memcached._tcp.my-memcached.ns.svc"]
+  resources: {}
+  extraArgs: []
+
+ruler:
+  enabled: true
+  # statefulset = evaluate + keep results in a local TSDB + upload blocks.
+  # stateless   = evaluate + remote_write results to receive, no local TSDB.
+  #               Disposable pods, trivial to scale/shard, dedup on ruler_replica.
+  mode: statefulset
+  evalInterval: 1m
+  # Alertmanager endpoints. Empty = alerting rules evaluate but fire nowhere.
+  # Supports plain URLs and Thanos SD prefixes (dnssrv+, dns+).
+  alertmanagers: []
+  #   - dnssrv+http://_web._tcp.alertmanager-operated.monitoring.svc
+
+  # Inline rule files. Each key becomes ONE ConfigMap + one file mounted at
+  # /etc/thanos/rules/<key>. Keep each value under ~900 KiB (see RULES.md).
+  ruleFiles: {}
+  #   recording.yaml: |
+  #     groups:
+  #       - name: job:http_requests:rate5m
+  #         rules:
+  #           - record: job:http_requests:rate5m
+  #             expr: sum by (job) (rate(http_requests_total[5m]))
+
+  # Pre-existing ConfigMaps to mount as rule files (for large / externally
+  # generated rule sets). Every key in each ConfigMap is mounted as a file.
+  existingRuleConfigMaps: []
+  #   - my-team-rules
+  #   - platform-alerts
+
+  # GitOps mode: instead of a fixed list, discover rule ConfigMaps by label at
+  # runtime (a k8s-sidecar syncs matching CMs into the rule dir; the reloader
+  # then reloads the ruler). Add/remove rules by adding/removing ConfigMaps —
+  # no chart upgrade. See examples/gitops-config/.
+  dynamicRules:
+    enabled: false
+    # label every rule ConfigMap must carry to be picked up
+    labelSelector: "thanos-stack.io/rule=true"
+    # limit discovery to these namespaces ("ALL" = cluster-wide)
+    namespaces: "ALL"
+    image: ghcr.io/kiwigrid/k8s-sidecar:1.30.10
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 96Mi }
+
+  # Sharding. Omit for a single shard named "default". Each shard is its own
+  # StatefulSet/Deployment + Service, discovered by Query. Assign rules per
+  # shard with ruleFileKeys (subset of .ruleFiles) and/or existingRuleConfigMaps.
+  shards: []
+  #   - name: platform
+  #     replicas: 2
+  #     ruleFileKeys: [platform-recording.yaml, platform-alerts.yaml]
+  #   - name: apps
+  #     replicas: 2
+  #     existingRuleConfigMaps: [app-team-rules]
+
+  persistence:
+    size: 10Gi
+    storageClass: ""
+  resources: {}
+  extraArgs: []
+  # sidecar that watches the mounted ConfigMaps and hits POST /-/reload
+  reloader:
+    image: quay.io/prometheus-operator/prometheus-config-reloader:v0.78.2
+    resources:
+      requests: { cpu: 10m, memory: 24Mi }
+      limits: { memory: 64Mi }
+
+# =============================================================================
+# Optional: Grafana Alloy collector — a demo/bootstrap metrics source.
+# Scrapes the common Kubernetes endpoints and remote_writes into this stack's
+# Receive. Turn on for a self-contained "does ingestion work?" deployment;
+# in production your existing Prometheus / Alloy fleet plays this role instead.
+# =============================================================================
+alloy:
+  enabled: false
+  image:
+    repository: grafana/alloy
+    tag: v1.19.2
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  # Extra external labels on everything Alloy ships (merged over .externalLabels).
+  externalLabels: {}
+  # Push everything Alloy scrapes as this Receive tenant (sets the THANOS-TENANT
+  # header on remote_write). Empty = no header (lands in receive.default-tenant-id).
+  tenant: ""
+  # OTLP metrics receiver. Apps send OTLP (gRPC/HTTP); Alloy derives the tenant
+  # from an OTel resource attribute, promotes it to a label, and Receive splits
+  # the write into per-tenant TSDBs on that label (needs multiTenancy.enabled).
+  otlp:
+    enabled: false
+    grpcPort: 4317
+    httpPort: 4318
+    # resource attribute carrying the tenant (e.g. "tenant", "service.namespace",
+    # "deployment.environment"). A metric without it falls back to `alloy.tenant`.
+    tenantResourceAttribute: tenant
+    # extra OTTL statements (datapoint context) appended to the transform
+    extraStatements: []
+  scrape:
+    interval: 30s
+    kubelet: true          # node /metrics (via apiserver proxy)
+    cadvisor: true         # per-container cpu/mem/net/fs (via apiserver proxy)
+    apiserver: true        # kube-apiserver request/latency/etcd metrics
+    kubeStateMetrics: true  # scraped only if KSM is present (svc discovery)
+    annotatedPods: true    # pods with prometheus.io/scrape=true
+    thanosStack: true      # this release's own Thanos components
+  # Per-scrape guard rails — applied to EVERY job. A target that exceeds any of
+  # these has its whole scrape rejected (see PROTECTION.md). 0 = no limit.
+  limits:
+    labelLimit: 40               # max labels on any one series
+    labelNameLengthLimit: 200    # max bytes in a label name
+    labelValueLengthLimit: 2048  # max bytes in a label value
+    sampleLimit: 0               # max samples accepted per scrape
+  # Raw Alloy-syntax appended to the generated config (extra scrape jobs etc.).
+  extraConfig: ""
+
+# =============================================================================
+# Optional bundled dependencies — OFF by default. Most clusters already run
+# these. Prefer wiring the stack to your existing Alertmanager via
+# `ruler.alertmanagers`.
+# =============================================================================
+alertmanager:
+  enabled: false
+memcached:
+  enabled: false

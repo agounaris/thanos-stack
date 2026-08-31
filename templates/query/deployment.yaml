@@ -1,0 +1,147 @@
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml -}}
+{{- $q := $cfg.query -}}
+{{- if $q.enabled -}}
+{{- $fn := include "thanos-stack.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-query
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query
+spec:
+  {{- if not $q.autoscaling.enabled }}
+  replicas: {{ $q.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "query") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thanos-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: query
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "thanos-stack.serviceAccountName" . }}
+      securityContext:
+        {{- include "thanos-stack.podSecurityContext" . | nindent 8 }}
+      {{- include "thanos-stack.podHardening" (dict "ctx" . "component" "query") | nindent 6 }}
+      containers:
+        - name: query
+          image: {{ include "thanos-stack.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "thanos-stack.containerSecurityContext" . | nindent 12 }}
+          args:
+            - query
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            - --query.auto-downsampling
+            - --query.max-concurrent={{ $q.maxConcurrent | default 20 }}
+            {{- if .Values.multiTenancy.enabled }}
+            - --query.enforce-tenancy
+            - --query.tenant-header={{ .Values.multiTenancy.tenantHeader }}
+            - --query.tenant-label-name={{ .Values.multiTenancy.tenantLabel }}
+            - --query.default-tenant-id={{ .Values.multiTenancy.defaultTenant }}
+            {{- end }}
+            {{- range $q.replicaLabels }}
+            - --query.replica-label={{ . }}
+            {{- end }}
+            {{- include "thanos-stack.storeEndpoints" (dict "ctx" .) | nindent 12 }}
+            {{- range $q.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - { name: grpc, containerPort: 10901 }
+            - { name: http, containerPort: 10902 }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 30
+          {{- with $q.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-query
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query
+spec:
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "query") | nindent 4 }}
+  ports:
+    - { name: http, port: 10902, targetPort: http }
+    - { name: grpc, port: 10901, targetPort: grpc }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-query-headless
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query
+spec:
+  clusterIP: None
+  selector:
+    {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "query") | nindent 4 }}
+  ports:
+    - { name: http, port: 10902, targetPort: http }
+    - { name: grpc, port: 10901, targetPort: grpc }
+{{- if gt (int $q.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}-query
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "thanos-stack.selectorLabels" (dict "ctx" . "component" "query") | nindent 6 }}
+{{- end }}
+{{- if $q.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fn }}-query
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: query
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fn }}-query
+  minReplicas: {{ $q.autoscaling.minReplicas }}
+  maxReplicas: {{ $q.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $q.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

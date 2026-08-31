@@ -1,0 +1,16 @@
+# Owner: platform / checkout
+# Recording rules — precomputed series, evaluated by Thanos Ruler against the
+# global Query view, written back to the stack (block upload or remote_write).
+groups:
+  - name: checkout.recording
+    interval: 30s
+    rules:
+      - record: service:checkout_requests:rate5m
+        expr: sum by (route, status) (rate(checkout_http_requests_total[5m]))
+      - record: service:checkout_request_errors:ratio5m
+        expr: |
+          sum by (route) (rate(checkout_http_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (route) (rate(checkout_http_requests_total[5m]))
+      - record: service:checkout_latency:p99_5m
+        expr: histogram_quantile(0.99, sum by (le, route) (rate(checkout_request_duration_seconds_bucket[5m])))

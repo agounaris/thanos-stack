@@ -1,0 +1,7 @@
+# Owner: data / etl
+groups:
+  - name: etl.recording
+    interval: 1m
+    rules:
+      - record: job:etl_rows_processed:rate5m
+        expr: sum by (pipeline) (rate(etl_rows_processed_total[5m]))

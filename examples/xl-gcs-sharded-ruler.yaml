@@ -1,0 +1,48 @@
+# Large multi-team stack: GCS, split receive, stateless sharded ruler,
+# custom store-gateway time shards, HPA on query.
+#   helm install thanos ./thanos-helm-chart -f examples/xl-gcs-sharded-ruler.yaml
+size: xl
+
+objstore:
+  existingSecret: thanos-objstore      # key: objstore.yml, holds a GCS config
+
+externalLabels:
+  cluster: prod
+  region: us-central1
+
+retention:
+  raw: 30d
+  fiveMinutes: 120d
+  oneHour: 2y
+
+overrides:
+  storeGateway:
+    timeShards:
+      - { name: hot,  minTime: "-7d",   maxTime: "" }
+      - { name: warm, minTime: "-45d",  maxTime: "-6d" }
+      - { name: cold, minTime: "-400d", maxTime: "-44d" }
+      - { name: deep, minTime: "",      maxTime: "-399d" }
+    replicasPerShard: 2
+  query:
+    autoscaling:
+      enabled: true
+      minReplicas: 6
+      maxReplicas: 20
+      targetCPUUtilizationPercentage: 65
+
+ruler:
+  mode: stateless
+  evalInterval: 30s
+  alertmanagers:
+    - dnssrv+http://_web._tcp.alertmanager-operated.monitoring.svc
+  # rules authored elsewhere (CI renders one ConfigMap per team)
+  shards:
+    - name: platform
+      replicas: 2
+      existingRuleConfigMaps: [platform-rules]
+    - name: payments
+      replicas: 2
+      existingRuleConfigMaps: [payments-rules]
+    - name: search
+      replicas: 2
+      existingRuleConfigMaps: [search-rules]

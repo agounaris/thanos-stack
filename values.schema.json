@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "thanos-stack values",
+  "type": "object",
+  "required": ["size", "objstore"],
+  "properties": {
+    "size": {
+      "type": "string",
+      "enum": ["small", "medium", "large", "xl", "xxl", "custom"]
+    },
+    "objstore": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "existingSecretKey": { "type": "string" },
+        "config": { "type": "object" }
+      }
+    },
+    "externalLabels": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string" }
+    },
+    "retention": {
+      "type": "object",
+      "properties": {
+        "raw": { "type": "string" },
+        "fiveMinutes": { "type": "string" },
+        "oneHour": { "type": "string" }
+      }
+    }
+  }
+}

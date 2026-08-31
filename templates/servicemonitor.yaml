@@ -1,0 +1,29 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- $cfg := include "thanos-stack.cfg" . | fromYaml }}
+{{- $fn := include "thanos-stack.fullname" . }}
+{{- $components := list "receive" "receive-router" "storegateway" "compactor" "query" "query-frontend" "ruler" }}
+{{- if .Values.alloy.enabled }}{{- $components = append $components "alloy" }}{{- end }}
+{{- range $c := $components }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fn }}-{{ $c }}
+  labels:
+    {{- include "thanos-stack.labels" $ | nindent 4 }}
+    {{- with $.Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $c }}
+  endpoints:
+    - port: http
+      interval: {{ $.Values.serviceMonitor.interval }}
+      path: /metrics
+  namespaceSelector:
+    matchNames: [{{ $.Release.Namespace }}]
+{{- end }}
+{{- end }}

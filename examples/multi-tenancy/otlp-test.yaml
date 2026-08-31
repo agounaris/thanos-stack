@@ -1,0 +1,51 @@
+# Send test OTLP metrics into the bundled Alloy OTLP receiver, tagged with a
+# tenant resource attribute. Receive splits them into the right per-tenant TSDB.
+#
+#   kubectl apply -f otlp-test.yaml
+#   kubectl -n default port-forward svc/thanos-stack-query 18090:10902 &
+#   curl -s -H 'THANOS-TENANT: acme' --get localhost:18090/api/v1/query \
+#     --data-urlencode 'query={__name__="gen", tenant_id="acme"}'
+#   # -> present.  Same query as globex/infra -> empty.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: otlp-test-acme
+  namespace: default
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: telemetrygen
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+          args:
+            - metrics
+            - --otlp-insecure
+            - --otlp-endpoint=thanos-stack-alloy.default.svc.cluster.local:4317
+            - --otlp-attributes=tenant="acme"          # <-- resource attribute => tenant
+            - --otlp-attributes=service.name="checkout"
+            - --duration=120s
+            - --rate=20
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: otlp-test-globex
+  namespace: default
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: telemetrygen
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+          args:
+            - metrics
+            - --otlp-insecure
+            - --otlp-endpoint=thanos-stack-alloy.default.svc.cluster.local:4317
+            - --otlp-attributes=tenant="globex"
+            - --otlp-attributes=service.name="billing"
+            - --duration=120s
+            - --rate=20

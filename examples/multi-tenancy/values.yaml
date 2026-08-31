@@ -1,0 +1,53 @@
+# Multi-tenant overlay. Layer on top of a base (e.g. local-docker-desktop.yaml):
+#   helm upgrade thanos-stack . -n default \
+#     -f examples/local-docker-desktop.yaml -f examples/multi-tenancy/values.yaml
+#
+# Create the htpasswd Secret first (username == tenant name; `shared` -> the default bucket):
+#   htpasswd -bcB htpasswd infra   infra-secret
+#   htpasswd -bB  htpasswd acme    acme-secret
+#   htpasswd -bB  htpasswd globex  globex-secret
+#   htpasswd -bB  htpasswd shared shared-secret     # -> the __no_tenant__ bucket
+#   htpasswd -bB  htpasswd nobody  nobody-secret      # valid login, no tenant -> 400
+#   kubectl -n default create secret generic thanos-tenant-htpasswd --from-file=htpasswd
+
+multiTenancy:
+  enabled: true
+  onMissingTenant: reject          # 400 if the caller maps to no tenant
+  defaultTenant: __no_tenant__     # header-less writes + the `shared` login land here
+  networkPolicy: true              # only the gateway may reach query / query-frontend
+  tenants:
+    - name: __no_tenant__          # the "default"/unattributed bucket, made queryable
+    - name: infra                  # the stack's own Alloy metrics
+    - name: acme
+      limits: { request: { series_limit: 500000 } }
+    - name: globex
+      limits: { request: { series_limit: 100000 } }
+  gateway:
+    enabled: true
+    replicas: 2
+    auth:
+      method: basic
+      existingSecret: thanos-tenant-htpasswd
+      userToTenant:
+        shared: __no_tenant__      # htpasswd user `shared` -> the default bucket
+
+  # WRITE-path gateway in front of receive-router. Receive has no tenant
+  # allowlist of its own — this is what enforces one.
+  ingestGateway:
+    enabled: true
+    replicas: 2
+    onUnauthenticated: reject        # unauthenticated push -> 401
+    #   (set to `default` to accept it into `defaultTenant` / __no_tenant__ instead)
+    auth:
+      method: basic                  # push clients send Basic auth; username == tenant
+      existingSecret: thanos-tenant-htpasswd
+      # PROD: prefer method: mtls — verified client-cert CN is the tenant, and a
+      # client with no cert can't spoof (its THANOS-TENANT header is ignored).
+    networkPolicy: true
+
+alloy:
+  tenant: infra                    # scraped metrics + un-tagged OTLP -> tenant `infra`
+  otlp:
+    enabled: true                  # OTLP receiver on :4317 (gRPC) / :4318 (HTTP)
+    tenantResourceAttribute: tenant # OTel resource attr -> tenant; Receive splits on it
+

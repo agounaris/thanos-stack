@@ -1,0 +1,44 @@
+# Smallest useful stack, S3, existing Alertmanager, a couple of inline rules.
+#   helm install thanos ./thanos-helm-chart -f examples/small-s3.yaml
+size: small
+
+objstore:
+  config:
+    type: S3
+    config:
+      bucket: thanos-metrics
+      endpoint: s3.eu-west-1.amazonaws.com
+      region: eu-west-1
+      # credentials via IRSA — no keys here
+
+externalLabels:
+  cluster: prod-eu
+
+retention:
+  raw: 15d
+  fiveMinutes: 60d
+  oneHour: 180d
+
+ruler:
+  alertmanagers:
+    - dnssrv+http://_web._tcp.alertmanager-operated.monitoring.svc
+  ruleFiles:
+    slo.yaml: |
+      groups:
+        - name: slo.rules
+          interval: 30s
+          rules:
+            - record: job:request_errors:ratio_rate5m
+              expr: |
+                sum by (job) (rate(http_requests_total{code=~"5.."}[5m]))
+                / sum by (job) (rate(http_requests_total[5m]))
+    alerts.yaml: |
+      groups:
+        - name: slo.alerts
+          rules:
+            - alert: ErrorBudgetBurn
+              expr: job:request_errors:ratio_rate5m > 0.02
+              for: 15m
+              labels: { severity: warning }
+              annotations:
+                summary: "{{ $labels.job }} burning error budget ({{ $value | humanizePercentage }})"

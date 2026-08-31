@@ -1,0 +1,17 @@
+apiVersion: v2
+name: thanos-stack
+description: >-
+  A full Thanos stack (receive, store gateway, compactor, query, query-frontend,
+  ruler) deployed from a single t-shirt size. Push/remote-write architecture.
+type: application
+version: 0.1.0
+appVersion: "v0.42.4"
+keywords:
+  - thanos
+  - prometheus
+  - metrics
+  - monitoring
+sources:
+  - https://github.com/thanos-io/thanos
+maintainers:
+  - name: agounaris

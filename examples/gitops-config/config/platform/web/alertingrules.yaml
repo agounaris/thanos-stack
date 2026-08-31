@@ -1,0 +1,10 @@
+# Owner: platform / web
+groups:
+  - name: web.alerts
+    rules:
+      - alert: WebNoTraffic
+        expr: service:web_requests:rate5m == 0
+        for: 10m
+        labels: { severity: warning, team: platform, service: web }
+        annotations:
+          summary: "web route {{ $labels.route }} is receiving no traffic"

@@ -1,0 +1,110 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- $fn := include "thanos-stack.fullname" . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fn }}
+  labels:
+    {{- include "thanos-stack.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: thanos-stack.availability
+      rules:
+        - alert: ThanosComponentDown
+          expr: |
+            sum by (job, namespace) (up{job=~".*{{ .Release.Name }}.*"}) == 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Thanos component {{`{{ $labels.job }}`}} is down"
+
+        - alert: ThanosComponentHighRestarts
+          expr: |
+            increase(kube_pod_container_status_restarts_total{pod=~"{{ .Release.Name }}.*"}[15m]) > 3
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{`{{ $labels.pod }}`}} restarting repeatedly"
+
+    - name: thanos-stack.compact
+      rules:
+        - alert: ThanosCompactHalted
+          expr: thanos_compact_halted{job=~".*{{ .Release.Name }}.*"} == 1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Thanos Compactor has halted — data will stop being downsampled/GC'd"
+
+        - alert: ThanosCompactHighCompactionFailures
+          expr: |
+            rate(thanos_compact_group_compactions_failures_total{job=~".*{{ .Release.Name }}.*"}[5m])
+            / rate(thanos_compact_group_compactions_total{job=~".*{{ .Release.Name }}.*"}[5m]) * 100 > 5
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Thanos Compactor failing >5% of compactions"
+
+    - name: thanos-stack.store
+      rules:
+        - alert: ThanosStoreGrpcErrorRate
+          expr: |
+            sum by (job) (rate(grpc_server_handled_total{grpc_code=~"Unknown|ResourceExhausted|Internal|Unavailable|DataLoss",job=~".*{{ .Release.Name }}.*storegateway.*"}[5m]))
+            / sum by (job) (rate(grpc_server_handled_total{job=~".*{{ .Release.Name }}.*storegateway.*"}[5m])) * 100 > 5
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Thanos Store Gateway {{`{{ $labels.job }}`}} >5% gRPC errors"
+
+    - name: thanos-stack.receive
+      rules:
+        - alert: ThanosReceiveHttpRequestErrorRateHigh
+          expr: |
+            sum by (job) (rate(http_requests_total{code=~"5..",job=~".*{{ .Release.Name }}.*receive.*",handler="receive"}[5m]))
+            / sum by (job) (rate(http_requests_total{job=~".*{{ .Release.Name }}.*receive.*",handler="receive"}[5m])) * 100 > 5
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Thanos Receive is rejecting >5% of remote-write requests"
+
+        - alert: ThanosReceiveHighReplicationFailures
+          expr: |
+            rate(thanos_receive_replications_total{result="error",job=~".*{{ .Release.Name }}.*receive.*"}[5m])
+            / rate(thanos_receive_replications_total{job=~".*{{ .Release.Name }}.*receive.*"}[5m]) * 100 > 5
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Thanos Receive replication failing (>5%) — check hashring peers"
+
+    - name: thanos-stack.rule
+      rules:
+        - alert: ThanosRuleHighRuleEvaluationFailures
+          expr: |
+            rate(prometheus_rule_evaluation_failures_total{job=~".*{{ .Release.Name }}.*ruler.*"}[5m])
+            / rate(prometheus_rule_evaluations_total{job=~".*{{ .Release.Name }}.*ruler.*"}[5m]) * 100 > 5
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Thanos Ruler {{`{{ $labels.job }}`}} failing >5% of rule evaluations"
+
+        - alert: ThanosRuleNoEvaluations
+          expr: |
+            sum by (job) (rate(prometheus_rule_evaluations_total{job=~".*{{ .Release.Name }}.*ruler.*"}[5m])) <= 0
+          for: 15m
+          labels: { severity: critical }
+          annotations:
+            summary: "Thanos Ruler {{`{{ $labels.job }}`}} is not evaluating any rules"
+
+    - name: thanos-stack.query
+      rules:
+        - alert: ThanosQueryHttpRequestQueryErrorRateHigh
+          expr: |
+            sum by (job) (rate(http_requests_total{code=~"5..",job=~".*{{ .Release.Name }}.*query.*",handler="query"}[5m]))
+            / sum by (job) (rate(http_requests_total{job=~".*{{ .Release.Name }}.*query.*",handler="query"}[5m])) * 100 > 5
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Thanos Query returning >5% errors on instant queries"
+{{- end }}
